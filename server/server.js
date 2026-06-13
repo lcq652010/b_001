@@ -14,24 +14,41 @@ app.use(express.json());
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const FRAMES_DIR = path.join(__dirname, 'frames');
+const LOCAL_FFMPEG = path.join(__dirname, 'ffmpeg.exe');
+const LOCAL_FFPROBE = path.join(__dirname, 'ffprobe.exe');
 
 [UPLOAD_DIR, FRAMES_DIR].forEach((dir) => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 let ffmpegAvailable = false;
-try {
-    const { execSync } = require('child_process');
-    execSync('ffmpeg -version', { stdio: 'ignore', timeout: 5000 });
+let ffmpegPath = null;
+let ffprobePath = null;
+
+if (fs.existsSync(LOCAL_FFMPEG) && fs.existsSync(LOCAL_FFPROBE)) {
+    ffmpegPath = LOCAL_FFMPEG;
+    ffprobePath = LOCAL_FFPROBE;
+    ffmpeg.setFfmpegPath(ffmpegPath);
+    ffmpeg.setFfprobePath(ffprobePath);
     ffmpegAvailable = true;
-} catch {
+    console.log(`Using local ffmpeg: ${ffmpegPath}`);
+} else {
     try {
-        const ffmpegStatic = require('ffmpeg-static');
-        if (ffmpegStatic) {
-            ffmpeg.setFfmpegPath(ffmpegStatic);
-            ffmpegAvailable = true;
-        }
-    } catch {}
+        const { execSync } = require('child_process');
+        execSync('ffmpeg -version', { stdio: 'ignore', timeout: 5000 });
+        ffmpegAvailable = true;
+        console.log('Using system ffmpeg');
+    } catch {
+        try {
+            const ffmpegStatic = require('ffmpeg-static');
+            if (ffmpegStatic) {
+                ffmpeg.setFfmpegPath(ffmpegStatic);
+                ffmpegAvailable = true;
+                ffmpegPath = ffmpegStatic;
+                console.log('Using ffmpeg-static');
+            }
+        } catch {}
+    }
 }
 
 const storage = multer.diskStorage({

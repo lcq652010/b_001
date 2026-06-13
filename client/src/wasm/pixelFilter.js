@@ -1,137 +1,108 @@
+const WASM_URL = '/wasm/pixel_filter.wasm';
+
 let wasmExports = null;
+let wasmMemory = null;
 let wasmReady = false;
+let wasmModule = null;
+let wasmInstance = null;
 
-function pixelateJS(data, width, height, blockSize) {
-    const bs = Math.max(1, blockSize);
-    const byCount = Math.ceil(height / bs);
-    const bxCount = Math.ceil(width / bs);
-
-    for (let by = 0; by < byCount; by++) {
-        for (let bx = 0; bx < bxCount; bx++) {
-            const x0 = bx * bs;
-            const y0 = by * bs;
-            const x1 = Math.min((bx + 1) * bs, width);
-            const y1 = Math.min((by + 1) * bs, height);
-
-            let rSum = 0, gSum = 0, bSum = 0, aSum = 0, count = 0;
-
-            for (let y = y0; y < y1; y++) {
-                for (let x = x0; x < x1; x++) {
-                    const idx = (y * width + x) * 4;
-                    rSum += data[idx];
-                    gSum += data[idx + 1];
-                    bSum += data[idx + 2];
-                    aSum += data[idx + 3];
-                    count++;
-                }
-            }
-
-            if (count === 0) continue;
-
-            const avgR = (rSum / count) | 0;
-            const avgG = (gSum / count) | 0;
-            const avgB = (bSum / count) | 0;
-            const avgA = (aSum / count) | 0;
-
-            for (let y = y0; y < y1; y++) {
-                for (let x = x0; x < x1; x++) {
-                    const idx = (y * width + x) * 4;
-                    data[idx] = avgR;
-                    data[idx + 1] = avgG;
-                    data[idx + 2] = avgB;
-                    data[idx + 3] = avgA;
-                }
-            }
-        }
+function getExports() {
+    if (!wasmReady || !wasmExports) {
+        throw new Error('WASM module not initialized. Call initFilter() first.');
     }
+    return wasmExports;
 }
 
-async function initWasmModule() {
-    const WASM_URL = '/wasm/pixel_filter_bg.wasm';
-    try {
-        const imports = { wbg: {} };
-        const stubs = [
-            '__wbindgen_throw',
-            '__wbindgen_error_new',
-            '__wbindgen_object_drop_ref',
-            '__wbindgen_is_undefined',
-            '__wbindgen_in',
-            '__wbindgen_is_object',
-            '__wbindgen_is_string',
-            '__wbindgen_is_function',
-            '__wbindgen_is_null',
-            '__wbindgen_boolean_get',
-            '__wbindgen_number_get',
-            '__wbindgen_string_get',
-            '__wbindgen_cb_drop',
-        ];
-        stubs.forEach((name) => {
-            imports.wbg[name] = function () { return 0; };
-        });
+async function initFilter() {
+    if (wasmReady) return true;
 
-        let instance;
+    try {
+        const resp = await fetch(WASM_URL);
+        if (!resp.ok) {
+            throw new Error(`Failed to load WASM: HTTP ${resp.status}`);
+        }
+        const bytes = await resp.arrayBuffer();
+
         try {
-            const resp = await fetch(WASM_URL);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const { instance: inst } = await WebAssembly.instantiateStreaming(resp, imports);
-            instance = inst;
+            const result = await WebAssembly.instantiateStreaming(resp, {});
+            wasmInstance = result.instance;
+            wasmModule = result.module;
         } catch {
-            const resp = await fetch(WASM_URL);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const bytes = await resp.arrayBuffer();
-            const { instance: inst } = await WebAssembly.instantiate(bytes, imports);
-            instance = inst;
+            const result = await WebAssembly.instantiate(bytes, {});
+            wasmInstance = result.instance;
+            wasmModule = result.module;
         }
 
-        const exports = instance.exports;
-        if (typeof exports.pixelate === 'function' && exports.memory && exports.__wbindgen_malloc && exports.__wbindgen_free) {
-            wasmExports = exports;
-            wasmReady = true;
-            return true;
+        wasmExports = wasmInstance.exports;
+        wasmMemory = wasmExports.memory;
+        wasmReady = true;
+
+        if (typeof wasmExports.pixelate !== 'function') {
+            throw new Error('WASM module missing pixelate() export');
         }
-        throw new Error('Missing expected WASM exports');
+        if (typeof wasmExports.malloc !== 'function') {
+            throw new Error('WASM module missing malloc() export');
+        }
+        if (typeof wasmExports.free !== 'function') {
+            throw new Error('WASM module missing free() export');
+        }
+
+        return true;
     } catch (err) {
-        console.warn('WASM module not available, using JS fallback:', err.message);
         wasmReady = false;
-        return false;
+        wasmExports = null;
+        wasmMemory = null;
+        wasmInstance = null;
+        wasmModule = null;
+        throw err;
     }
 }
 
-function pixelateWasm(data, width, height, blockSize) {
-    if (!wasmExports || !wasmExports.__wbindgen_malloc) return false;
-
-    const len = data.length;
-    const ptr = wasmExports.__wbindgen_malloc(len);
-    if (!ptr) return false;
-
-    try {
-        const mem = new Uint8Array(wasmExports.memory.buffer);
-        mem.set(data, ptr);
-        wasmExports.pixelate(ptr, len, width, height, blockSize);
-        const result = new Uint8Array(wasmExports.memory.buffer, ptr, len);
-        data.set(result);
-    } finally {
-        wasmExports.__wbindgen_free(ptr, len);
-    }
-    return true;
-}
-
-export async function initFilter() {
-    return initWasmModule();
-}
-
-export function isWasmReady() {
+function isWasmReady() {
     return wasmReady;
 }
 
-export function applyPixelFilter(imageData, blockSize = 16) {
-    const { data, width, height } = imageData;
+function destroyFilter() {
+    if (wasmMemory && wasmMemory.buffer) {
+        try {
+            if (typeof WebAssembly.Memory.prototype.grow === 'function') {
+            }
+        } catch {}
+    }
+    wasmExports = null;
+    wasmMemory = null;
+    wasmInstance = null;
+    wasmModule = null;
+    wasmReady = false;
+}
 
-    if (wasmReady && wasmExports) {
-        const ok = pixelateWasm(data, width, height, blockSize);
-        if (ok) return imageData;
+function applyPixelFilter(imageData, blockSize = 16) {
+    const ex = getExports();
+    const { data, width, height } = imageData;
+    const len = data.length;
+
+    if (len === 0 || width === 0 || height === 0) {
+        return imageData;
     }
 
-    pixelateJS(data, width, height, blockSize);
+    const ptr = ex.malloc(len);
+    if (!ptr) {
+        throw new Error('WASM: failed to allocate memory for frame');
+    }
+
+    try {
+        const mem = new Uint8Array(wasmMemory.buffer);
+        mem.set(data, ptr);
+
+        ex.pixelate(ptr, len, width, height, blockSize);
+
+        const result = new Uint8Array(wasmMemory.buffer, ptr, len);
+        data.set(result);
+    } finally {
+        ex.free(ptr, len);
+    }
+
     return imageData;
 }
+
+export { initFilter, isWasmReady, destroyFilter, applyPixelFilter };
