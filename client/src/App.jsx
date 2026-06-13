@@ -3,7 +3,7 @@ import { initFilter, isWasmReady, destroyFilter, applyPixelFilter } from './wasm
 import './App.css';
 
 const API_BASE = '/api';
-const PRELOAD_COUNT = 10;
+const PRELOAD_COUNT = 15;
 
 function App() {
     const [videoId, setVideoId] = useState(null);
@@ -17,6 +17,7 @@ function App() {
     const [blockSize, setBlockSize] = useState(16);
     const [playbackActive, setPlaybackActive] = useState(false);
     const [frameReady, setFrameReady] = useState(false);
+    const [wasmError, setWasmError] = useState(null);
 
     const canvasRef = useRef(null);
     const frameCacheRef = useRef(new Map());
@@ -28,6 +29,7 @@ function App() {
     const pendingFrameRef = useRef(null);
     const lastFrameRef = useRef(0);
     const preloadTokenRef = useRef(0);
+    const isDraggingRef = useRef(false);
 
     useEffect(() => {
         initFilter()
@@ -36,7 +38,8 @@ function App() {
             })
             .catch((err) => {
                 console.error('Failed to init WASM filter:', err);
-                alert('WASM 滤镜模块加载失败: ' + err.message);
+                setWasmReady(false);
+                setWasmError('WASM 滤镜模块加载失败: ' + err.message);
             });
         return () => {
             destroyFilter();
@@ -65,19 +68,15 @@ function App() {
 
     const processAndRender = useCallback((imgData) => {
         if (!wasmReady || !isWasmReady()) {
-            return;
+            throw new Error('WASM 滤镜模块未就绪，无法处理图像');
         }
-        try {
-            const cloned = new ImageData(
-                new Uint8ClampedArray(imgData.data),
-                imgData.width,
-                imgData.height
-            );
-            applyPixelFilter(cloned, blockSize);
-            renderToCanvas(cloned);
-        } catch (err) {
-            console.error('WASM filter error:', err);
-        }
+        const cloned = new ImageData(
+            new Uint8ClampedArray(imgData.data),
+            imgData.width,
+            imgData.height
+        );
+        applyPixelFilter(cloned, blockSize);
+        renderToCanvas(cloned);
     }, [wasmReady, blockSize, renderToCanvas]);
 
     const loadFrameImage = useCallback(async (frameIdx) => {
@@ -157,19 +156,60 @@ function App() {
         })();
     }, [videoId, totalFrames, loadFrameImage]);
 
-    const requestFrameRender = useCallback((frameIdx) => {
+    const requestFrameRender = useCallback((frameIdx, isDragging = false) => {
         if (frameIdx < 1 || frameIdx > totalFrames) return;
+
+        pendingFrameRef.current = frameIdx;
+
+        if (isDragging) {
+            const cached = frameCacheRef.current.get(frameIdx);
+            if (cached) {
+                setCurrentFrame(frameIdx);
+                setFrameReady(true);
+                try {
+                    processAndRender(cached);
+                } catch (err) {
+                    console.error('WASM filter error:', err);
+                }
+            }
+            preloadFrames(frameIdx);
+
+            if (!rafScheduledRef.current) {
+                rafScheduledRef.current = true;
+                requestAnimationFrame(() => {
+                    rafScheduledRef.current = false;
+                    const idx = pendingFrameRef.current;
+                    if (!idx) return;
+                    const cachedNow = frameCacheRef.current.get(idx);
+                    if (cachedNow && idx !== lastFrameRef.current) {
+                        setCurrentFrame(idx);
+                        setFrameReady(true);
+                        try {
+                            processAndRender(cachedNow);
+                        } catch (err) {
+                            console.error('WASM filter error:', err);
+                        }
+                        lastFrameRef.current = idx;
+                    }
+                });
+            }
+            return;
+        }
 
         const cached = frameCacheRef.current.get(frameIdx);
         if (cached) {
+            setCurrentFrame(frameIdx);
             setFrameReady(true);
-            processAndRender(cached);
+            try {
+                processAndRender(cached);
+            } catch (err) {
+                console.error('WASM filter error:', err);
+            }
             preloadFrames(frameIdx);
             return;
         }
 
         setFrameReady(false);
-        pendingFrameRef.current = frameIdx;
         setLoading(true);
 
         if (!rafScheduledRef.current) {
@@ -180,19 +220,23 @@ function App() {
                 if (!idx) return;
 
                 const imgData = await loadFrameImage(idx);
-                if (imgData) {
-                    if (pendingFrameRef.current === idx || currentFrame === idx) {
+                if (imgData && pendingFrameRef.current === idx) {
+                    setCurrentFrame(idx);
+                    try {
                         processAndRender(imgData);
-                        setFrameReady(true);
-                        setLoading(false);
-                        preloadFrames(idx);
+                    } catch (err) {
+                        console.error('WASM filter error:', err);
                     }
+                    setFrameReady(true);
+                    setLoading(false);
+                    preloadFrames(idx);
+                    lastFrameRef.current = idx;
                 } else {
                     setLoading(false);
                 }
             });
         }
-    }, [totalFrames, currentFrame, loadFrameImage, processAndRender, preloadFrames]);
+    }, [totalFrames, loadFrameImage, processAndRender, preloadFrames]);
 
     useEffect(() => {
         if (videoId && totalFrames > 0 && currentFrame > 0) {
@@ -248,6 +292,10 @@ function App() {
     }, [currentFrame]);
 
     const handleUpload = async (e) => {
+        if (!wasmReady || wasmError) {
+            alert(wasmError || 'WASM 引擎未就绪，请刷新页面重试');
+            return;
+        }
         const file = e.target.files?.[0];
         if (!file) return;
 
@@ -297,6 +345,29 @@ function App() {
     };
 
     const handleSliderInput = (e) => {
+        const val = parseInt(e.target.value, 10);
+        if (val >= 1 && val <= totalFrames) {
+            if (isDraggingRef.current) {
+                requestFrameRender(val, true);
+            } else {
+                setCurrentFrame(val);
+            }
+        }
+    };
+
+    const handleSliderDragStart = () => {
+        isDraggingRef.current = true;
+        if (playbackActive) {
+            setPlaybackActive(false);
+            if (playbackRef.current) {
+                cancelAnimationFrame(playbackRef.current);
+                playbackRef.current = null;
+            }
+        }
+    };
+
+    const handleSliderDragEnd = (e) => {
+        isDraggingRef.current = false;
         const val = parseInt(e.target.value, 10);
         if (val >= 1 && val <= totalFrames) {
             setCurrentFrame(val);
@@ -360,9 +431,14 @@ function App() {
                             <p className="status-sub">
                                 WASM 引擎:{' '}
                                 <span className={wasmReady ? 'status-ok' : 'status-err'}>
-                                    {wasmReady ? '就绪' : '加载中...'}
+                                    {wasmError ? '错误' : wasmReady ? '就绪' : '加载中...'}
                                 </span>
                             </p>
+                            {wasmError && (
+                                <p className="status-err" style={{ marginTop: '8px', fontSize: '12px' }}>
+                                    {wasmError}
+                                </p>
+                            )}
                         </div>
                     )}
                     {extracting && (
@@ -378,7 +454,16 @@ function App() {
 
                 <div className="controls-panel">
                     <div className="upload-section">
-                        <label className="upload-btn" htmlFor="video-upload">
+                        <label
+                            className={`upload-btn ${!wasmReady || wasmError ? 'btn-disabled' : ''}`}
+                            htmlFor={wasmReady && !wasmError ? 'video-upload' : undefined}
+                            onClick={(e) => {
+                                if (!wasmReady || wasmError) {
+                                    e.preventDefault();
+                                    alert(wasmError || 'WASM 引擎加载中，请稍候...');
+                                }
+                            }}
+                        >
                             选择视频文件
                         </label>
                         <input
@@ -471,6 +556,11 @@ function App() {
                                 max={totalFrames}
                                 value={currentFrame}
                                 onChange={handleSliderInput}
+                                onInput={handleSliderInput}
+                                onMouseDown={handleSliderDragStart}
+                                onMouseUp={handleSliderDragEnd}
+                                onTouchStart={handleSliderDragStart}
+                                onTouchEnd={handleSliderDragEnd}
                                 className="timeline-slider"
                             />
                             <div className="timeline-thumbnails">

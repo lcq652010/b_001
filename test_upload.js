@@ -1,97 +1,110 @@
 const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
 const http = require('http');
 
-const filePath = 'D:/AA_solo_0608/b_001/server/test_video.mp4';
-const boundary = '----WebKitFormBoundaryTest123';
+const videoPath = path.join(__dirname, 'server', 'test_video.mp4');
 
-function createTestVideo(callback) {
-    const { execSync } = require('child_process');
+function uploadVideo() {
+    return new Promise((resolve, reject) => {
+        const form = new FormData();
+        form.append('video', fs.createReadStream(videoPath), {
+            filename: 'test_video.mp4',
+            contentType: 'video/mp4',
+        });
+
+        const options = {
+            hostname: 'localhost',
+            port: 3001,
+            path: '/api/upload',
+            method: 'POST',
+            headers: form.getHeaders(),
+        };
+
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(data));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+
+        req.on('error', reject);
+        form.pipe(req);
+    });
+}
+
+function checkStatus(videoId) {
+    return new Promise((resolve, reject) => {
+        http.get(`http://localhost:3001/api/videos/${videoId}/status`, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(data));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }).on('error', reject);
+    });
+}
+
+function checkFrame(videoId, frameIdx) {
+    return new Promise((resolve, reject) => {
+        http.get(`http://localhost:3001/api/frames/${videoId}/${frameIdx}`, (res) => {
+            resolve({
+                statusCode: res.statusCode,
+                contentType: res.headers['content-type'],
+                contentLength: res.headers['content-length'],
+            });
+        }).on('error', reject);
+    });
+}
+
+async function main() {
     try {
-        execSync('cd /d D:\\AA_solo_0608\\b_001\\server && ffmpeg.exe -y -f lavfi -i "testsrc=size=320x240:duration=2:rate=24" -c:v libx264 -pix_fmt yuv420p -an test_video.mp4', { stdio: 'ignore', timeout: 30000 });
-        callback(null);
+        console.log('=== Step 1: Upload video ===');
+        const uploadResult = await uploadVideo();
+        console.log('Upload result:', JSON.stringify(uploadResult, null, 2));
+
+        if (!uploadResult.videoId) {
+            console.error('No videoId returned');
+            process.exit(1);
+        }
+
+        const videoId = uploadResult.videoId;
+        console.log('\n=== Step 2: Poll status ===');
+
+        for (let i = 0; i < 15; i++) {
+            const status = await checkStatus(videoId);
+            console.log(`Poll ${i + 1}:`, JSON.stringify(status, null, 2));
+
+            if (status.ready || status.status === 'ready') {
+                console.log('\n=== Step 3: Check frames ===');
+                for (let f = 1; f <= Math.min(5, status.totalFrames); f++) {
+                    const frameRes = await checkFrame(videoId, f);
+                    console.log(`Frame ${f}:`, JSON.stringify(frameRes));
+                }
+
+                if (status.totalFrames > 0) {
+                    const lastFrame = await checkFrame(videoId, status.totalFrames);
+                    console.log(`Frame ${status.totalFrames} (last):`, JSON.stringify(lastFrame));
+                }
+                break;
+            }
+
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        console.log('\n=== Done ===');
     } catch (err) {
-        callback(err);
+        console.error('Error:', err.message);
     }
 }
 
-createTestVideo((err) => {
-    if (err) {
-        console.error('Failed to create test video:', err.message);
-        process.exit(1);
-    }
-
-    const fileSize = fs.statSync(filePath).size;
-    const fileContent = fs.readFileSync(filePath);
-
-    const pre = `--${boundary}\r\nContent-Disposition: form-data; name="video"; filename="test_video.mp4"\r\nContent-Type: video/mp4\r\n\r\n`;
-    const post = `\r\n--${boundary}--\r\n`;
-
-    const totalSize = Buffer.byteLength(pre) + fileSize + Buffer.byteLength(post);
-
-    const options = {
-        hostname: 'localhost',
-        port: 3001,
-        path: '/api/upload',
-        method: 'POST',
-        headers: {
-            'Content-Type': `multipart/form-data; boundary=${boundary}`,
-            'Content-Length': totalSize,
-        },
-    };
-
-    const req = http.request(options, (res) => {
-        let body = '';
-        res.on('data', (chunk) => { body += chunk; });
-        res.on('end', () => {
-            console.log(`Upload status: ${res.statusCode}`);
-            console.log('Response:', body);
-
-            const data = JSON.parse(body);
-            if (data.videoId) {
-                console.log(`\nVideo ID: ${data.videoId}`);
-                console.log(`FPS: ${data.fps}`);
-                console.log(`Resolution: ${data.width}x${data.height}`);
-                console.log(`Duration: ${data.duration}s`);
-                console.log(`ffmpeg available: ${data.ffmpegAvailable}`);
-
-                const pollStatus = () => {
-                    http.get(`http://localhost:3001/api/videos/${data.videoId}/status`, (res2) => {
-                        let b = '';
-                        res2.on('data', (c) => { b += c; });
-                        res2.on('end', () => {
-                            const statusData = JSON.parse(b);
-                            console.log(`Status: ready=${statusData.ready}, totalFrames=${statusData.totalFrames}`);
-                            if (!statusData.ready && statusData.totalFrames < 47) {
-                                setTimeout(pollStatus, 500);
-                            } else {
-                                console.log('\n=== Frame extraction complete! ===');
-                                console.log(`Total frames: ${statusData.totalFrames}`);
-
-                                http.get(`http://localhost:3001/api/frames/${data.videoId}/1`, (res3) => {
-                                    console.log(`Frame 1 status: ${res3.statusCode}`);
-                                    console.log(`Frame 1 content-type: ${res3.headers['content-type']}`);
-                                    let size = 0;
-                                    res3.on('data', (c) => { size += c.length; });
-                                    res3.on('end', () => {
-                                        console.log(`Frame 1 size: ${size} bytes`);
-                                        console.log('\n=== ALL TESTS PASSED ===');
-                                        fs.unlinkSync(filePath);
-                                    });
-                                });
-                            }
-                        });
-                    });
-                };
-                setTimeout(pollStatus, 1500);
-            }
-        });
-    });
-
-    req.write(pre);
-    req.write(fileContent);
-    req.end(post);
-
-    req.on('error', (e) => {
-        console.error('Upload error:', e.message);
-    });
-});
+main();
