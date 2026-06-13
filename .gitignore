@@ -7,3 +7,4 @@ build/
 .vscode/
 .idea/
 *.log
+ffmpeg-tool/ffmpeg-master-latest-win64-gpl/bin/*.exe
