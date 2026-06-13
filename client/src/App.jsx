@@ -3,7 +3,7 @@ import { initFilter, isWasmReady, destroyFilter, applyPixelFilter } from './wasm
 import './App.css';
 
 const API_BASE = '/api';
-const PRELOAD_COUNT = 15;
+const PRELOAD_COUNT = 10;
 
 function App() {
     const [videoId, setVideoId] = useState(null);
