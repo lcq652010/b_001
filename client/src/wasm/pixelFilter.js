@@ -1,13 +1,10 @@
 const WASM_URL = '/wasm/pixel_filter.wasm';
-const ALLOC_ALIGN = 4;
 
 let cachedModule = null;
+let sharedMemory = null;
 let wasmInstance = null;
 let wasmExports = null;
-let wasmMemory = null;
 let wasmReady = false;
-
-const allocMap = new Map();
 
 function getExports() {
     if (!wasmReady || !wasmExports) {
@@ -37,15 +34,27 @@ async function loadModule() {
 }
 
 async function initFilter() {
-    if (wasmReady) return true;
+    if (wasmReady && wasmExports?.pixelate) {
+        return true;
+    }
 
     try {
         const module = await loadModule();
-        const instance = await WebAssembly.instantiate(module, {});
+
+        const importObj = {};
+        if (sharedMemory) {
+            importObj.env = { memory: sharedMemory };
+        }
+
+        const instance = await WebAssembly.instantiate(module, importObj);
 
         wasmInstance = instance;
         wasmExports = instance.exports;
-        wasmMemory = wasmExports.memory;
+
+        if (!sharedMemory) {
+            sharedMemory = wasmExports.memory;
+        }
+
         wasmReady = true;
 
         if (typeof wasmExports.pixelate !== 'function') {
@@ -62,7 +71,6 @@ async function initFilter() {
     } catch (err) {
         wasmReady = false;
         wasmExports = null;
-        wasmMemory = null;
         wasmInstance = null;
         throw err;
     }
@@ -73,35 +81,19 @@ function isWasmReady() {
 }
 
 function destroyFilter() {
-    allocMap.clear();
     wasmExports = null;
-    wasmMemory = null;
     wasmInstance = null;
     wasmReady = false;
 }
 
-function wasmMalloc(size) {
-    const ex = getExports();
-    const ptr = ex.malloc(size);
-    if (!ptr) {
-        throw new Error('WASM: failed to allocate memory');
-    }
-    allocMap.set(ptr, { size, align: ALLOC_ALIGN });
-    return ptr;
-}
-
-function wasmFree(ptr) {
-    const info = allocMap.get(ptr);
-    if (!info) {
-        console.warn('WASM: free called on unknown pointer', ptr);
-        return;
-    }
-    const ex = getExports();
-    ex.free(ptr, info.size);
-    allocMap.delete(ptr);
+function fullDestroyFilter() {
+    destroyFilter();
+    cachedModule = null;
+    sharedMemory = null;
 }
 
 function applyPixelFilter(imageData, blockSize = 16) {
+    const ex = getExports();
     const { data, width, height } = imageData;
     const len = data.length;
 
@@ -109,19 +101,21 @@ function applyPixelFilter(imageData, blockSize = 16) {
         return imageData;
     }
 
-    const ptr = wasmMalloc(len);
+    const ptr = ex.malloc(len);
+    if (!ptr) {
+        throw new Error('WASM: failed to allocate memory for frame');
+    }
 
     try {
-        const mem = new Uint8Array(wasmMemory.buffer);
+        const mem = new Uint8Array(sharedMemory.buffer);
         mem.set(data, ptr);
 
-        const ex = getExports();
         ex.pixelate(ptr, len, width, height, blockSize);
 
-        const result = new Uint8Array(wasmMemory.buffer, ptr, len);
+        const result = new Uint8Array(sharedMemory.buffer, ptr, len);
         data.set(result);
     } finally {
-        wasmFree(ptr);
+        ex.free(ptr);
     }
 
     return imageData;
@@ -131,8 +125,24 @@ function getModuleCached() {
     return cachedModule !== null;
 }
 
-function getAllocCount() {
-    return allocMap.size;
+function getMemoryShared() {
+    return sharedMemory !== null;
 }
 
-export { initFilter, isWasmReady, destroyFilter, applyPixelFilter, wasmMalloc, wasmFree, getModuleCached, getAllocCount };
+function getAllocCount() {
+    if (wasmExports && typeof wasmExports.alloc_count === 'function') {
+        return wasmExports.alloc_count();
+    }
+    return 0;
+}
+
+export {
+    initFilter,
+    isWasmReady,
+    destroyFilter,
+    fullDestroyFilter,
+    applyPixelFilter,
+    getModuleCached,
+    getMemoryShared,
+    getAllocCount,
+};

@@ -20,7 +20,7 @@ function App() {
 
     const canvasRef = useRef(null);
     const frameCacheRef = useRef(new Map());
-    const pendingLoadRef = useRef(new Set());
+    const loadingPromisesRef = useRef(new Map());
     const sliderRef = useRef(null);
     const fileInputRef = useRef(null);
     const playbackRef = useRef(null);
@@ -49,7 +49,7 @@ function App() {
                 cancelAnimationFrame(playbackRef.current);
             }
             frameCacheRef.current.clear();
-            pendingLoadRef.current.clear();
+            loadingPromisesRef.current.clear();
         };
     }, []);
 
@@ -86,39 +86,45 @@ function App() {
         if (frameCacheRef.current.has(frameIdx)) {
             return frameCacheRef.current.get(frameIdx);
         }
-        if (pendingLoadRef.current.has(frameIdx)) return null;
-
-        pendingLoadRef.current.add(frameIdx);
-        try {
-            const resp = await fetch(`${API_BASE}/frames/${videoId}/${frameIdx}`);
-            if (!resp.ok) throw new Error(`Frame ${frameIdx}: HTTP ${resp.status}`);
-            const blob = await resp.blob();
-            const bmp = await createImageBitmap(blob);
-            const oc = new OffscreenCanvas(bmp.width, bmp.height);
-            const ctx = oc.getContext('2d');
-            ctx.drawImage(bmp, 0, 0);
-            const imgData = ctx.getImageData(0, 0, bmp.width, bmp.height);
-            bmp.close();
-
-            frameCacheRef.current.set(frameIdx, imgData);
-
-            const maxCache = PRELOAD_COUNT * 2 + 30;
-            if (frameCacheRef.current.size > maxCache) {
-                const keys = [...frameCacheRef.current.keys()].sort((a, b) => a - b);
-                const center = currentFrame;
-                keys
-                    .sort((a, b) => Math.abs(a - center) - Math.abs(b - center))
-                    .slice(maxCache * 0.7)
-                    .forEach((k) => frameCacheRef.current.delete(k));
-            }
-
-            return imgData;
-        } catch (err) {
-            console.warn(`Failed to load frame ${frameIdx}:`, err.message);
-            return null;
-        } finally {
-            pendingLoadRef.current.delete(frameIdx);
+        if (loadingPromisesRef.current.has(frameIdx)) {
+            return loadingPromisesRef.current.get(frameIdx);
         }
+
+        const promise = (async () => {
+            try {
+                const resp = await fetch(`${API_BASE}/frames/${videoId}/${frameIdx}`);
+                if (!resp.ok) throw new Error(`Frame ${frameIdx}: HTTP ${resp.status}`);
+                const blob = await resp.blob();
+                const bmp = await createImageBitmap(blob);
+                const oc = new OffscreenCanvas(bmp.width, bmp.height);
+                const ctx = oc.getContext('2d');
+                ctx.drawImage(bmp, 0, 0);
+                const imgData = ctx.getImageData(0, 0, bmp.width, bmp.height);
+                bmp.close();
+
+                frameCacheRef.current.set(frameIdx, imgData);
+
+                const maxCache = PRELOAD_COUNT * 2 + 30;
+                if (frameCacheRef.current.size > maxCache) {
+                    const keys = [...frameCacheRef.current.keys()].sort((a, b) => a - b);
+                    const center = currentFrame;
+                    keys
+                        .sort((a, b) => Math.abs(a - center) - Math.abs(b - center))
+                        .slice(maxCache * 0.7)
+                        .forEach((k) => frameCacheRef.current.delete(k));
+                }
+
+                return imgData;
+            } catch (err) {
+                console.warn(`Failed to load frame ${frameIdx}:`, err.message);
+                return null;
+            } finally {
+                loadingPromisesRef.current.delete(frameIdx);
+            }
+        })();
+
+        loadingPromisesRef.current.set(frameIdx, promise);
+        return promise;
     }, [videoId, totalFrames, currentFrame]);
 
     const preloadFrames = useCallback((centerFrame) => {
@@ -136,7 +142,7 @@ function App() {
 
         const toLoad = indices.filter(
             (idx) =>
-                !frameCacheRef.current.has(idx) && !pendingLoadRef.current.has(idx)
+                !frameCacheRef.current.has(idx) && !loadingPromisesRef.current.has(idx)
         );
 
         if (toLoad.length === 0) return;
@@ -144,7 +150,7 @@ function App() {
         (async () => {
             for (const idx of toLoad) {
                 if (token !== preloadTokenRef.current) break;
-                if (!frameCacheRef.current.has(idx) && !pendingLoadRef.current.has(idx)) {
+                if (!frameCacheRef.current.has(idx) && !loadingPromisesRef.current.has(idx)) {
                     await loadFrameImage(idx);
                 }
             }
@@ -246,7 +252,7 @@ function App() {
         if (!file) return;
 
         frameCacheRef.current.clear();
-        pendingLoadRef.current.clear();
+        loadingPromisesRef.current.clear();
         pendingFrameRef.current = null;
         setVideoId(null);
         setVideoInfo(null);

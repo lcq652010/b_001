@@ -1,4 +1,13 @@
 use std::alloc::{alloc, dealloc, Layout};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+
+const DEFAULT_ALIGN: usize = 4;
+
+fn alloc_table() -> &'static Mutex<BTreeMap<usize, (usize, usize)>> {
+    static TABLE: OnceLock<Mutex<BTreeMap<usize, (usize, usize)>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 #[no_mangle]
 pub extern "C" fn malloc(size: u32) -> *mut u8 {
@@ -6,21 +15,60 @@ pub extern "C" fn malloc(size: u32) -> *mut u8 {
     if s == 0 {
         return std::ptr::null_mut();
     }
-    let layout = Layout::from_size_align(s, 4).unwrap();
-    unsafe { alloc(layout) }
+    let layout = match Layout::from_size_align(s, DEFAULT_ALIGN) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let ptr = unsafe { alloc(layout) };
+    if !ptr.is_null() {
+        if let Ok(mut table) = alloc_table().lock() {
+            table.insert(ptr as usize, (s, DEFAULT_ALIGN));
+        }
+    }
+    ptr
 }
 
 #[no_mangle]
-pub extern "C" fn free(ptr: *mut u8, size: u32) {
+pub extern "C" fn free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    let s = size as usize;
-    if s == 0 {
+    let (size, align) = {
+        let mut table = match alloc_table().lock() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        table.remove(&(ptr as usize)).unwrap_or((0, 0))
+    };
+    if size == 0 {
         return;
     }
-    let layout = Layout::from_size_align(s, 4).unwrap();
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
     unsafe { dealloc(ptr, layout); }
+}
+
+#[no_mangle]
+pub extern "C" fn malloc_size(ptr: *mut u8) -> u32 {
+    if ptr.is_null() {
+        return 0;
+    }
+    let table = match alloc_table().lock() {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    table.get(&(ptr as usize)).map(|(s, _)| *s as u32).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn alloc_count() -> u32 {
+    let table = match alloc_table().lock() {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    table.len() as u32
 }
 
 #[no_mangle]

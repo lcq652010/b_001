@@ -71,8 +71,83 @@ const upload = multer({
 
 const videoMeta = {};
 
+const MAX_CONCURRENT_EXTRACTIONS = 2;
+const extractionQueue = [];
+let activeExtractions = 0;
+
+function enqueueExtraction(videoId) {
+    const meta = videoMeta[videoId];
+    if (!meta) return;
+
+    meta.status = 'queued';
+    extractionQueue.push(videoId);
+    console.log(`Video ${videoId}: queued for extraction (queue: ${extractionQueue.length})`);
+    processNextExtraction();
+}
+
+function processNextExtraction() {
+    if (activeExtractions >= MAX_CONCURRENT_EXTRACTIONS) return;
+    if (extractionQueue.length === 0) return;
+
+    const videoId = extractionQueue.shift();
+    const meta = videoMeta[videoId];
+    if (!meta) {
+        processNextExtraction();
+        return;
+    }
+
+    activeExtractions += 1;
+    meta.status = 'extracting';
+    console.log(`Video ${videoId}: starting extraction (active: ${activeExtractions}, queue: ${extractionQueue.length})`);
+
+    startExtraction(videoId);
+}
+
+function startExtraction(videoId) {
+    const meta = videoMeta[videoId];
+    if (!meta || !meta.videoPath) {
+        finishExtraction(videoId);
+        return;
+    }
+
+    const outputDir = path.join(FRAMES_DIR, videoId);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    const framePattern = path.join(outputDir, 'frame_%05d.png');
+
+    ffmpeg(meta.videoPath)
+        .output(framePattern)
+        .noAudio()
+        .on('end', () => {
+            const frames = fs.readdirSync(outputDir).filter((f) => f.endsWith('.png')).sort();
+            meta.totalFrames = frames.length;
+            meta.status = 'ready';
+            console.log(`Video ${videoId}: extracted ${frames.length} frames`);
+            finishExtraction(videoId);
+        })
+        .on('error', (extractErr) => {
+            console.error('Frame extraction error:', extractErr.message);
+            meta.status = 'error';
+            meta.error = extractErr.message;
+            finishExtraction(videoId);
+        })
+        .run();
+}
+
+function finishExtraction(videoId) {
+    activeExtractions = Math.max(0, activeExtractions - 1);
+    console.log(`Video ${videoId}: extraction finished (active: ${activeExtractions}, queue: ${extractionQueue.length})`);
+    processNextExtraction();
+}
+
 app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', ffmpeg: ffmpegAvailable });
+    res.json({
+        status: 'ok',
+        ffmpeg: ffmpegAvailable,
+        activeExtractions,
+        queueLength: extractionQueue.length,
+        maxConcurrent: MAX_CONCURRENT_EXTRACTIONS,
+    });
 });
 
 app.post('/api/upload', upload.single('video'), (req, res) => {
@@ -96,9 +171,11 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
         height: 0,
         duration: 0,
         totalFrames: 0,
+        status: 'pending',
     };
 
     if (!ffmpegAvailable) {
+        videoMeta[videoId].status = 'error';
         return res.json({
             videoId,
             fps: 0,
@@ -106,13 +183,16 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
             height: 0,
             duration: 0,
             ffmpegAvailable: false,
-            message: 'Video uploaded. ffmpeg not available on server, will use frontend frame extraction.',
+            status: 'error',
+            message: 'Video uploaded. ffmpeg not available on server.',
         });
     }
 
     ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
             console.error('ffprobe error:', err.message);
+            videoMeta[videoId].status = 'error';
+            videoMeta[videoId].error = err.message;
             return res.json({
                 videoId,
                 fps: 0,
@@ -120,13 +200,14 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
                 height: 0,
                 duration: 0,
                 ffmpegAvailable: true,
-                ffprobeError: true,
+                status: 'error',
                 message: 'Video uploaded but probe failed: ' + err.message,
             });
         }
 
         const videoStream = metadata.streams.find((s) => s.codec_type === 'video');
         if (!videoStream) {
+            videoMeta[videoId].status = 'error';
             return res.json({
                 videoId,
                 fps: 0,
@@ -134,6 +215,7 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
                 height: 0,
                 duration: 0,
                 ffmpegAvailable: true,
+                status: 'error',
                 message: 'No video stream found',
             });
         }
@@ -145,20 +227,7 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
 
         videoMeta[videoId] = { ...videoMeta[videoId], fps, width, height, duration };
 
-        const framePattern = path.join(outputDir, 'frame_%05d.png');
-
-        ffmpeg(videoPath)
-            .output(framePattern)
-            .noAudio()
-            .on('end', () => {
-                const frames = fs.readdirSync(outputDir).filter((f) => f.endsWith('.png')).sort();
-                videoMeta[videoId].totalFrames = frames.length;
-                console.log(`Video ${videoId}: extracted ${frames.length} frames`);
-            })
-            .on('error', (extractErr) => {
-                console.error('Frame extraction error:', extractErr.message);
-            })
-            .run();
+        enqueueExtraction(videoId);
 
         res.json({
             videoId,
@@ -167,7 +236,11 @@ app.post('/api/upload', upload.single('video'), (req, res) => {
             height,
             duration,
             ffmpegAvailable: true,
-            message: 'Video uploaded, frame extraction started',
+            status: videoMeta[videoId].status,
+            queuePosition: videoMeta[videoId].status === 'queued' ? extractionQueue.length : 0,
+            message: videoMeta[videoId].status === 'extracting'
+                ? 'Video uploaded, frame extraction started'
+                : 'Video uploaded, queued for frame extraction',
         });
     });
 });
@@ -195,7 +268,11 @@ app.get('/api/videos/:videoId/status', (req, res) => {
         : [];
     const totalFrames = frames.length;
 
-    const done = meta.duration > 0 ? totalFrames >= Math.floor(meta.duration * meta.fps) - 2 : totalFrames > 0;
+    const done = meta.status === 'ready' || (meta.duration > 0 && totalFrames >= Math.floor(meta.duration * meta.fps) - 2);
+
+    const queuePos = meta.status === 'queued'
+        ? extractionQueue.indexOf(videoId) + 1
+        : 0;
 
     res.json({
         videoId,
@@ -205,6 +282,10 @@ app.get('/api/videos/:videoId/status', (req, res) => {
         duration: meta.duration,
         totalFrames,
         ready: done,
+        status: meta.status || 'pending',
+        queuePosition: queuePos,
+        activeExtractions,
+        queueLength: extractionQueue.length,
         ffmpegAvailable,
     });
 });
